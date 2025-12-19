@@ -216,7 +216,20 @@ impl ActionLog {
         loop {
             futures::select_biased! {
                 buffer_update = buffer_updates.next() => {
-                    if let Some((author, buffer_snapshot)) = buffer_update {
+                    if let Some((mut author, mut buffer_snapshot)) = buffer_update {
+                        // TODO kb `buffer.edit(` made by agent input below fires off this code path again
+                        // as we react on buffer edits and send them under "user" edits here again and again.
+                        // Below is a stub to deduplicate things, but this should be done on the editor level
+
+                        // Drain any pending updates and keep only the latest snapshot.
+                        // This coalesces rapid edits to avoid repeatedly recalculating diffs.
+                        // while let Ok(Some((next_author, next_snapshot))) = buffer_updates.try_next() {
+                        //     // If any update was from Agent, treat the coalesced update as Agent
+                        //     if matches!(next_author, ChangeAuthor::Agent) {
+                        //         author = ChangeAuthor::Agent;
+                        //     }
+                        //     buffer_snapshot = next_snapshot;
+                        // }
                         Self::track_edits(&this, &buffer, author, buffer_snapshot, cx).await?;
                     } else {
                         break;
@@ -246,39 +259,50 @@ impl ActionLog {
                 .get_mut(buffer)
                 .context("buffer not tracked")?;
 
-            let rebase = cx.background_spawn({
-                let mut base_text = tracked_buffer.diff_base.clone();
-                let old_snapshot = tracked_buffer.snapshot.clone();
-                let new_snapshot = buffer_snapshot.clone();
-                let unreviewed_edits = tracked_buffer.unreviewed_edits.clone();
-                let edits = diff_snapshots(&old_snapshot, &new_snapshot);
-                async move {
-                    if let ChangeAuthor::User = author {
-                        apply_non_conflicting_edits(
-                            &unreviewed_edits,
-                            edits,
-                            &mut base_text,
-                            new_snapshot.as_rope(),
-                        );
+            let old_snapshot = tracked_buffer.snapshot.clone();
+            let new_snapshot = buffer_snapshot.clone();
+
+            if !new_snapshot.version().changed_since(old_snapshot.version()) {
+                Ok(None)
+            } else {
+                let rebase = cx.background_spawn({
+                    let mut base_text = tracked_buffer.diff_base.clone();
+
+                    let unreviewed_edits = tracked_buffer.unreviewed_edits.clone();
+                    let edits = diff_snapshots(&old_snapshot, &new_snapshot);
+                    async move {
+                        if let ChangeAuthor::User = author {
+                            apply_non_conflicting_edits(
+                                &unreviewed_edits,
+                                edits,
+                                &mut base_text,
+                                new_snapshot.as_rope(),
+                            );
+                        }
+
+                        (Arc::new(base_text.to_string()), base_text)
                     }
+                });
 
-                    (Arc::new(base_text.to_string()), base_text)
-                }
-            });
-
-            anyhow::Ok(rebase)
+                anyhow::Ok(Some(rebase))
+            }
         })??;
-        let (new_base_text, new_diff_base) = rebase.await;
 
-        Self::update_diff(
-            this,
-            buffer,
-            buffer_snapshot,
-            new_base_text,
-            new_diff_base,
-            cx,
-        )
-        .await
+        if let Some(rebase) = rebase {
+            let (new_base_text, new_diff_base) = rebase.await;
+
+            Self::update_diff(
+                this,
+                buffer,
+                buffer_snapshot,
+                new_base_text,
+                new_diff_base,
+                cx,
+            )
+            .await?;
+        }
+
+        Ok(())
     }
 
     async fn keep_committed_edits(
