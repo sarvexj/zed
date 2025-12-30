@@ -66,14 +66,22 @@ pub struct SearchResultsHandle {
     trigger_search: Box<dyn FnOnce(&mut App) -> Task<()> + Send + Sync>,
 }
 
+pub struct SearchResults<T> {
+    pub _task_handle: Task<()>,
+    pub rx: Receiver<T>,
+}
 impl SearchResultsHandle {
-    pub fn results(self, cx: &mut App) -> Receiver<SearchResult> {
-        (self.trigger_search)(cx).detach();
-        self.results
+    pub fn results(self, cx: &mut App) -> SearchResults<SearchResult> {
+        SearchResults {
+            _task_handle: (self.trigger_search)(cx),
+            rx: self.results,
+        }
     }
-    pub fn matching_buffers(self, cx: &mut App) -> Receiver<Entity<Buffer>> {
-        (self.trigger_search)(cx).detach();
-        self.matching_buffers
+    pub fn matching_buffers(self, cx: &mut App) -> SearchResults<Entity<Buffer>> {
+        SearchResults {
+            _task_handle: (self.trigger_search)(cx),
+            rx: self.matching_buffers,
+        }
     }
 }
 
@@ -164,6 +172,7 @@ impl Search {
                 unnamed_buffers.push(handle)
             };
         }
+        let open_buffers = Arc::new(open_buffers);
         let executor = cx.background_executor().clone();
         let (tx, rx) = unbounded();
         let (grab_buffer_snapshot_tx, grab_buffer_snapshot_rx) = unbounded();
@@ -214,7 +223,7 @@ impl Search {
                             ))
                             .boxed_local(),
                             Self::open_buffers(
-                                &self.buffer_store,
+                                self.buffer_store,
                                 get_buffer_for_full_scan_rx,
                                 grab_buffer_snapshot_tx,
                                 cx.clone(),
@@ -247,23 +256,25 @@ impl Search {
                             query: Some(query.to_proto()),
                             limit: self.limit as _,
                         });
+                        let weak_buffer_store = self.buffer_store.downgrade();
+                        let buffer_store = self.buffer_store;
                         let Ok(guard) = cx.update(|cx| {
                             Project::retain_remotely_created_models_impl(
                                 &models,
-                                &self.buffer_store,
+                                &buffer_store,
                                 &self.worktree_store,
                                 cx,
                             )
                         }) else {
                             return;
                         };
-                        let buffer_store = self.buffer_store.downgrade();
+
                         let issue_remote_buffers_request = cx
                             .spawn(async move |cx| {
                                 let _ = maybe!(async move {
                                     let response = request.await?;
                                     let (tx, rx) = unbounded();
-                                    buffer_store.update(cx, |this, _| {
+                                    weak_buffer_store.update(cx, |this, _| {
                                         this.register_project_search_result_handle(
                                             response.handle,
                                             tx,
@@ -295,22 +306,27 @@ impl Search {
 
                 let should_find_all_matches = !tx.is_closed();
 
-                let worker_pool = executor.scoped(|scope| {
-                    let num_cpus = executor.num_cpus();
+                let _executor = executor.clone();
+                let worker_pool = executor.spawn(async move {
+                    let num_cpus = _executor.num_cpus();
 
                     assert!(num_cpus > 0);
-                    for _ in 0..executor.num_cpus() - 1 {
-                        let worker = Worker {
-                            query: &query,
-                            open_buffers: &open_buffers,
-                            candidates: candidate_searcher.clone(),
-                            find_all_matches_rx: find_all_matches_rx.clone(),
-                        };
-                        scope.spawn(worker.run());
-                    }
+                    _executor
+                        .scoped(|scope| {
+                            for _ in 0..num_cpus - 1 {
+                                let worker = Worker {
+                                    query: query.clone(),
+                                    open_buffers: open_buffers.clone(),
+                                    candidates: candidate_searcher.clone(),
+                                    find_all_matches_rx: find_all_matches_rx.clone(),
+                                };
+                                scope.spawn(worker.run());
+                            }
 
-                    drop(find_all_matches_rx);
-                    drop(candidate_searcher);
+                            drop(find_all_matches_rx);
+                            drop(candidate_searcher);
+                        })
+                        .await;
                 });
 
                 let (sorted_matches_tx, sorted_matches_rx) = unbounded();
@@ -372,6 +388,7 @@ impl Search {
         async move |cx| {
             _ = maybe!(async move {
                 let gitignored_tracker = PathInclusionMatcher::new(query.clone());
+                let include_ignored = query.include_ignored();
                 for worktree in worktrees {
                     let (mut snapshot, worktree_settings) = worktree
                         .read_with(cx, |this, _| {
@@ -404,27 +421,28 @@ impl Search {
                         }
                         snapshot = worktree.read_with(cx, |this, _| this.snapshot())?;
                     }
-                    cx.background_executor()
-                        .scoped(|scope| {
-                            scope.spawn(async {
-                                for entry in snapshot.files(query.include_ignored(), 0) {
-                                    let (should_scan_tx, should_scan_rx) = oneshot::channel();
+                    let tx = tx.clone();
+                    let results = results.clone();
 
-                                    let Ok(_) = tx
-                                        .send(InputPath {
-                                            entry: entry.clone(),
-                                            snapshot: snapshot.clone(),
-                                            should_scan_tx,
-                                        })
-                                        .await
-                                    else {
-                                        return;
-                                    };
-                                    if results.send(should_scan_rx).await.is_err() {
-                                        return;
-                                    };
-                                }
-                            })
+                    cx.background_executor()
+                        .spawn(async move {
+                            for entry in snapshot.files(include_ignored, 0) {
+                                let (should_scan_tx, should_scan_rx) = oneshot::channel();
+
+                                let Ok(_) = tx
+                                    .send(InputPath {
+                                        entry: entry.clone(),
+                                        snapshot: snapshot.clone(),
+                                        should_scan_tx,
+                                    })
+                                    .await
+                                else {
+                                    return;
+                                };
+                                if results.send(should_scan_rx).await.is_err() {
+                                    return;
+                                };
+                            }
                         })
                         .await;
                 }
@@ -458,7 +476,7 @@ impl Search {
 
     /// Background workers cannot open buffers by themselves, hence main thread will do it on their behalf.
     async fn open_buffers(
-        buffer_store: &Entity<BufferStore>,
+        buffer_store: Entity<BufferStore>,
         rx: Receiver<ProjectPath>,
         find_all_matches_tx: Sender<Entity<Buffer>>,
         mut cx: AsyncApp,
@@ -576,9 +594,9 @@ impl Search {
     }
 }
 
-struct Worker<'search> {
-    query: &'search SearchQuery,
-    open_buffers: &'search HashSet<ProjectEntryId>,
+struct Worker {
+    query: Arc<SearchQuery>,
+    open_buffers: Arc<HashSet<ProjectEntryId>>,
     candidates: FindSearchCandidates,
     /// Ok, we're back in background: run full scan & find all matches in a given buffer snapshot.
     /// Then, when you're done, share them via the channel you were given.
@@ -589,7 +607,7 @@ struct Worker<'search> {
     )>,
 }
 
-impl Worker<'_> {
+impl Worker {
     async fn run(self) {
         let (
             input_paths_rx,
@@ -620,7 +638,7 @@ impl Worker<'_> {
 
         loop {
             let handler = RequestHandler {
-                query: self.query,
+                query: &self.query,
                 open_entries: &self.open_buffers,
                 fs: fs.as_deref(),
                 confirm_contents_will_match_tx: &confirm_contents_will_match_tx,
@@ -707,7 +725,7 @@ impl RequestHandler<'_> {
                 return Ok(());
             }
 
-            if self.query.detect(file).unwrap_or(false) {
+            if self.query.detect(file).await.unwrap_or(false) {
                 // Yes, we should scan the whole file.
                 entry.should_scan_tx.send(entry.path).await?;
             }
